@@ -84,12 +84,19 @@ class SurvivorStrategy:
         self.broker = broker
         self.symbol_initials = self.strat_var_symbol_initials
         self.order_manager = order_manager  # Store OrderTracker
-        self.broker.download_instruments()
-        self.instruments = self.broker.instruments_df[self.broker.instruments_df['tradingsymbol'].str.startswith(self.symbol_initials)]   # For Zerodha
-        if self.instruments.shape[0] == 0:
-            logger.error(f"No instruments found for {self.symbol_initials}")
-            logger.error(f"Instument {self.symbol_initials} not found. Please check the symbol initials")
-            return
+        if self.broker.__class__.__name__ == 'FlattradeBroker':
+            self.instruments = self.broker.api.searchscrip(exchange='NFO', searchtext=self.symbol_initials)
+            if not self.instruments or not self.instruments.get('values'):
+                logger.error(f"No instruments found for {self.symbol_initials}")
+                return
+            self.instruments = self.instruments['values']
+        else:
+            self.broker.download_instruments()
+            self.instruments = self.broker.instruments_df[self.broker.instruments_df['tradingsymbol'].str.startswith(self.symbol_initials)]   # For Zerodha
+            if self.instruments.shape[0] == 0:
+                logger.error(f"No instruments found for {self.symbol_initials}")
+                logger.error(f"Instument {self.symbol_initials} not found. Please check the symbol initials")
+                return
         
         self.strike_difference = None      
         self._initialize_state()
@@ -137,21 +144,55 @@ class SurvivorStrategy:
         if self.strike_difference is not None:
             return self.strike_difference
             
-        # Filter for CE instruments to calculate strike difference 
-        ce_instruments = self.instruments[
-            self.instruments['tradingsymbol'].str.startswith(symbol_initials) & 
-            self.instruments['tradingsymbol'].str.endswith('CE')
-        ]
-        
-        if ce_instruments.shape[0] < 2:
-            logger.error(f"Not enough CE instruments found for {symbol_initials} to calculate strike difference")
-            return 0
-        # Sort by strike
-        ce_instruments_sorted = ce_instruments.sort_values('strike')
-        # Take the top 2
-        top2 = ce_instruments_sorted.head(2)
-        # Calculate the difference
-        self.strike_difference = abs(top2.iloc[1]['strike'] - top2.iloc[0]['strike'])
+        if self.broker.__class__.__name__ == 'FlattradeBroker':
+            ce_instruments = [i for i in self.instruments if i['tsym'].startswith(symbol_initials) and i['tsym'].endswith('CE')]
+            if len(ce_instruments) < 2:
+                logger.error(f"Not enough CE instruments found for {symbol_initials} to calculate strike difference")
+                return 0
+
+            # Flattrade does not provide strike price directly in searchscrip, so we need to parse it from the symbol
+            for i in ce_instruments:
+                try:
+                    # e.g. NIFTY24SEPFUT
+                    # e.g. NIFTY30JAN2524500CE
+                    i['strike'] = float(i['tsym'][-7:-2])
+                except (ValueError, IndexError):
+                    i['strike'] = 0 # Cannot parse strike
+
+            ce_instruments_sorted = sorted(ce_instruments, key=lambda x: x['strike'])
+
+            # Find two instruments with valid and different strikes
+            first = None
+            second = None
+            for i in ce_instruments_sorted:
+                if i['strike'] > 0:
+                    if first is None:
+                        first = i
+                    elif i['strike'] != first['strike']:
+                        second = i
+                        break
+
+            if first and second:
+                self.strike_difference = abs(second['strike'] - first['strike'])
+            else:
+                logger.error("Could not determine strike difference from Flattrade instruments.")
+                self.strike_difference = 0 # Or some default
+        else:
+            # Filter for CE instruments to calculate strike difference
+            ce_instruments = self.instruments[
+                self.instruments['tradingsymbol'].str.startswith(symbol_initials) &
+                self.instruments['tradingsymbol'].str.endswith('CE')
+            ]
+
+            if ce_instruments.shape[0] < 2:
+                logger.error(f"Not enough CE instruments found for {symbol_initials} to calculate strike difference")
+                return 0
+            # Sort by strike
+            ce_instruments_sorted = ce_instruments.sort_values('strike')
+            # Take the top 2
+            top2 = ce_instruments_sorted.head(2)
+            # Calculate the difference
+            self.strike_difference = abs(top2.iloc[1]['strike'] - top2.iloc[0]['strike'])
         return self.strike_difference
 
     def on_ticks_update(self, ticks):
@@ -420,31 +461,68 @@ class SurvivorStrategy:
         # Calculate target strike price
         target_strike = ltp + symbol_gap
         
-        # Filter instruments for matching criteria
-        df = self.instruments[
-            (self.instruments['tradingsymbol'].str.startswith(self.strat_var_symbol_initials)) &
-            (self.instruments['instrument_type'] == option_type) &
-            (self.instruments['segment'] == "NFO-OPT")
-        ]
-        
-        if df.empty:
-            return None
+        if self.broker.__class__.__name__ == 'FlattradeBroker':
+            # In Flattrade, 'segment' is not available in searchscrip, and 'instrument_type' is part of the symbol
             
-        # Find closest strike within acceptable tolerance
-        df['target_strike_diff'] = (df['strike'] - target_strike).abs()
-        
-        # Filter to strikes within half strike difference (tolerance for rounding)
-        tolerance = self._get_strike_difference(self.strat_var_symbol_initials) / 2
-        df = df[df['target_strike_diff'] <= tolerance]
-        
-        if df.empty:
-            logger.error(f"No instrument found for {self.strat_var_symbol_initials} {option_type} "
-                        f"within {tolerance} of {target_strike}")
-            return None
+            # 1. Filter instruments
+            filtered_instruments = [
+                inst for inst in self.instruments
+                if inst['tsym'].startswith(self.strat_var_symbol_initials) and inst['tsym'].endswith(option_type)
+            ]
+
+            if not filtered_instruments:
+                return None
+
+            # 2. Calculate target_strike_diff for each instrument
+            for inst in filtered_instruments:
+                try:
+                    strike_price = float(inst['tsym'][-7:-2])
+                    inst['strike'] = strike_price # Add strike to dict
+                    inst['target_strike_diff'] = abs(strike_price - target_strike)
+                except (ValueError, IndexError):
+                    inst['target_strike_diff'] = float('inf') # Invalid format, ignore
+
+            # 3. Find the best match
+            tolerance = self._get_strike_difference(self.strat_var_symbol_initials) / 2
+
+            eligible_instruments = [
+                inst for inst in filtered_instruments
+                if 'target_strike_diff' in inst and inst['target_strike_diff'] <= tolerance
+            ]
+
+            if not eligible_instruments:
+                logger.error(f"No instrument found for {self.strat_var_symbol_initials} {option_type} "
+                            f"within {tolerance} of {target_strike}")
+                return None
+
+            # Return the one with the minimum difference
+            best = min(eligible_instruments, key=lambda x: x['target_strike_diff'])
+            # Flattrade uses 'tsym', but the rest of the strategy expects 'tradingsymbol'
+            best['tradingsymbol'] = best['tsym']
+            return best
+
+        else: # Existing logic for Zerodha/other brokers using dataframes
+            df = self.instruments[
+                (self.instruments['tradingsymbol'].str.startswith(self.strat_var_symbol_initials)) &
+                (self.instruments['instrument_type'] == option_type) &
+                (self.instruments['segment'] == "NFO-OPT")
+            ]
+
+            if df.empty:
+                return None
+
+            df['target_strike_diff'] = (df['strike'] - target_strike).abs()
+
+            tolerance = self._get_strike_difference(self.strat_var_symbol_initials) / 2
+            df = df[df['target_strike_diff'] <= tolerance]
             
-        # Return the closest match
-        best = df.sort_values('target_strike_diff').iloc[0]
-        return best.to_dict()
+            if df.empty:
+                logger.error(f"No instrument found for {self.strat_var_symbol_initials} {option_type} "
+                            f"within {tolerance} of {target_strike}")
+                return None
+
+            best = df.sort_values('target_strike_diff').iloc[0]
+            return best.to_dict()
 
     def _find_price_eligible_symbol(self, option_type):
         """
@@ -616,7 +694,7 @@ if __name__ == "__main__":
     from dispatcher import DataDispatcher
     from orders import OrderTracker
     from strategy.survivor import SurvivorStrategy
-    from brokers.zerodha import ZerodhaBroker
+    from brokers.base import BrokerBase
     from logger import logger
     from queue import Queue
     import random
@@ -797,10 +875,16 @@ PARAMETER GROUPS:
                         help='Display current configuration (after applying overrides) and exit. '
                              'Useful for verifying parameter values before trading.')
         
+        parser.add_argument('--broker', type=str, choices=['zerodha', 'fyers', 'flattrade'],
+                        help='Broker to use for trading')
+
         parser.add_argument('--config-file', type=str, default=config_file,
                         help='Path to YAML configuration file containing default values. '
                              'Defaults to system/strategy/configs/survivor.yml')
         
+        parser.add_argument('--yes', action='store_true',
+                        help='Automatically answer yes to all prompts')
+
         return parser
 
     def show_config(config):
@@ -883,6 +967,7 @@ PARAMETER GROUPS:
     # This allows clean separation between CLI argument naming conventions
     # and internal configuration parameter names
     arg_to_config_mapping = {
+        'broker': 'broker',
         'symbol_initials': 'symbol_initials',
         'index_symbol': 'index_symbol',
         'pe_symbol_gap': 'pe_symbol_gap',
@@ -923,9 +1008,10 @@ PARAMETER GROUPS:
     # ==========================================================================
     
     # Validate that user has updated default configuration values
-    def validate_configuration(config):
+    def validate_configuration(config, auto_yes=False):
         """
-        Validate that user has updated at least some default configuration values
+        Validate that user has updated at least some default configuration values.
+        If auto_yes is True, it will automatically proceed without asking for confirmation.
         Returns True if config is valid, False otherwise
         """
         # Define default values that indicate user hasn't updated config
@@ -1001,18 +1087,22 @@ PARAMETER GROUPS:
             print("   • Potential losses")
             print("="*80)
             
-            # Ask for user confirmation
-            while True:
-                response = input("\nDo you want to proceed with this configuration? (yes/no): ").lower().strip()
-                if response in ['yes', 'y']:
-                    print("\n✅ Proceeding with current configuration...")
-                    return True
-                elif response in ['no', 'n']:
-                    print("\n❌ Strategy execution cancelled by user.")
-                    print("Please update your configuration and try again.")
-                    return False
-                else:
-                    print("Please enter 'yes' or 'no'.")
+            if auto_yes:
+                print("\n✅ Proceeding with current configuration (auto-confirmed)...")
+                return True
+            else:
+                # Ask for user confirmation
+                while True:
+                    response = input("\nDo you want to proceed with this configuration? (yes/no): ").lower().strip()
+                    if response in ['yes', 'y']:
+                        print("\n✅ Proceeding with current configuration...")
+                        return True
+                    elif response in ['no', 'n']:
+                        print("\n❌ Strategy execution cancelled by user.")
+                        print("Please update your configuration and try again.")
+                        return False
+                    else:
+                        print("Please enter 'yes' or 'no'.")
         
         # If all values have been updated, proceed without confirmation
         print("\n" + "="*80)
@@ -1024,7 +1114,7 @@ PARAMETER GROUPS:
         return True
     
     # Run configuration validation
-    if not validate_configuration(config):
+    if not validate_configuration(config, auto_yes=args.yes):
         logger.error("Configuration validation failed. Please update your configuration.")
         sys.exit(1)
 
@@ -1050,12 +1140,26 @@ PARAMETER GROUPS:
     
     
     # Create broker interface for market data and order execution
-    if os.getenv("BROKER_TOTP_ENABLE") == "true":
-        logger.info("Using TOTP login flow")
-        broker = ZerodhaBroker(without_totp=False)
+    broker_name = config.get('broker', 'zerodha')  # Default to zerodha if not specified
+    if broker_name == 'zerodha':
+        from brokers.zerodha import ZerodhaBroker
+        if os.getenv("BROKER_TOTP_ENABLE") == "true":
+            logger.info("Using Zerodha TOTP login flow")
+            broker = ZerodhaBroker(without_totp=False)
+        else:
+            logger.info("Using Zerodha normal login flow")
+            broker = ZerodhaBroker(without_totp=True)
+    elif broker_name == 'fyers':
+        from brokers.fyers import FyersBroker
+        logger.info("Using Fyers broker")
+        broker = FyersBroker()
+    elif broker_name == 'flattrade':
+        from brokers.flattrade import FlattradeBroker
+        logger.info("Using Flattrade broker")
+        broker = FlattradeBroker()
     else:
-        logger.info("Using normal login flow")
-        broker = ZerodhaBroker(without_totp=True)
+        logger.error(f"Broker '{broker_name}' is not supported.")
+        sys.exit(1)
     
     # Create order tracking system for position management
     order_tracker = OrderTracker() 
@@ -1110,7 +1214,8 @@ PARAMETER GROUPS:
     # ==========================================================================
     
     # Start websocket connection for real-time data
-    broker.connect_websocket()
+    if broker.__class__.__name__ != 'FlattradeBroker':
+        broker.connect_websocket()
 
     # Initialize the trading strategy with all dependencies
     strategy = SurvivorStrategy(broker, config, order_tracker)

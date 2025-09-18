@@ -14,4 +14,8 @@ dependencies = [
     "pyyaml>=6.0.2",
     "ratelimit>=2.2.1",
     "requests>=2.31.0",
+    "NorenRestApiPy",
 ]
+
+[tool.setuptools.packages.find]
+include = ["brokers*", "strategy*"]
